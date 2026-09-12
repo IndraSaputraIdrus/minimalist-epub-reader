@@ -1,14 +1,16 @@
 <script lang="ts">
-	import { getMimeFromExtension, resolvePath } from '$lib';
+	import { getMimeFromExtension, resolvePath, type Manifest, type Spine, type NavItem } from '$lib';
 	import { unzipSync, type Unzipped } from 'fflate';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
+	import { tick } from 'svelte';
+	import SideBar from '$lib/components/sideBar.svelte';
 
-	type Manifest = Record<string, { href: string; mediaType: string }>;
-	type Spine = { id: string; href: string };
-	type NavItem = { index: number; href: string; title: string };
+	let isReady = $state(false);
 
 	let viewer = $state<HTMLDivElement | null>(null);
+	let shadowRoot: ShadowRoot | null = null;
+
 	let fileName = $state<string | null>(null);
 	let title = $state<string | null>(null);
 
@@ -23,6 +25,7 @@
 	let files: Unzipped | null = null;
 
 	const onFileChange = async (e: Event) => {
+		isReady = false;
 		const target = e.target as HTMLInputElement;
 		const file = target.files?.[0];
 
@@ -53,7 +56,10 @@
 		const navDoc = domParser.parseFromString(navXml, 'application/xhtml+xml');
 		list = getList(navDoc);
 
-		renderChapter();
+		isReady = true;
+		tick().then(() => {
+			renderChapter();
+		});
 	};
 
 	function getList(navDoc: Document): Array<NavItem> {
@@ -117,7 +123,7 @@
 		const doc = domParser.parseFromString(raw, 'application/xhtml+xml');
 
 		if (!basePath) return;
-		const images = doc.querySelectorAll('img');
+		const images = doc.querySelectorAll('img, image');
 		for (const image of images) {
 			const imageUrl = image.getAttribute('src') ?? '';
 			const targetImage = resolvePath(basePath, imageUrl);
@@ -134,17 +140,27 @@
 		}
 
 		const html = new XMLSerializer().serializeToString(doc);
-		viewer!.innerHTML = html;
+		if (!shadowRoot) {
+			shadowRoot = viewer!.attachShadow({ mode: 'closed' });
+		}
+		shadowRoot.innerHTML = '';
+		shadowRoot.innerHTML = html;
+		viewer!.scrollTop = 0;
 	}
 
-	function prevButton() {
+	function prevIndex() {
 		if (currentIndex < 0) return;
 		goto(`?index=${currentIndex - 1}`).then(() => renderChapter());
 	}
 
-	function nextButton() {
+	function nextIndex() {
 		if (currentIndex > spine.length + 1) return;
 		goto(`?index=${currentIndex + 1}`).then(() => renderChapter());
+	}
+
+	function resetIndex() {
+		currentIndex = 0;
+		goto(`?index=${currentIndex}`).then(() => renderChapter());
 	}
 
 	function changeSpineIndex(index: number) {
@@ -152,38 +168,51 @@
 		goto(`?index=${index}`).then(() => renderChapter());
 	}
 
-	$inspect(currentIndex);
+	$inspect(isReady);
 </script>
 
-<main class="flex min-h-dvh flex-col gap-5 p-5">
-	<input
-		onchange={onFileChange}
-		class="border border-black bg-slate-300"
-		id="epub-input"
-		type="file"
-		accept=".epub,application/epub+zip"
-	/>
-	<div class="h-32 border">
-		<p>
-			{title ?? 'No title'}
-		</p>
-		<div class="flex gap-2">
-			<button class="rounded bg-red-200 px-4 py-2 text-red-500" onclick={prevButton}>Prev</button>
-			<button class="rounded bg-red-200 px-4 py-2 text-red-500" onclick={nextButton}>Next</button>
+{#snippet Navigation()}
+	<div class="join grid grid-cols-3">
+		<button class="btn join-item btn-soft btn-primary" onclick={prevIndex}>Prev</button>
+		<button class="btn join-item btn-soft btn-secondary" onclick={resetIndex}>Reset</button>
+		<button class="btn join-item btn-soft btn-primary" onclick={nextIndex}>Next</button>
+	</div>
+{/snippet}
+
+{#snippet Navbar()}
+	<div class="navbar gap-5 bg-base-100">
+		<div class="flex-1">
+			<input
+				onchange={onFileChange}
+				class="file-input file-input-sm md:file-input-md"
+				id="epub-input"
+				type="file"
+				accept=".epub,application/epub+zip"
+			/>
+		</div>
+		<div class="flex-none">
+			{#if isReady}
+				<SideBar {changeSpineIndex} {list} />
+			{/if}
 		</div>
 	</div>
-	<div class="grid flex-1 grid-cols-2 gap-5">
-		<div bind:this={viewer} id="viewer" class="border">test</div>
-		<div class="border">
-			<ul>
-				{#each list as item}
-					<li>
-						<button class="hover:opacity-80" onclick={() => changeSpineIndex(item.index)}
-							>{item.index} {item.title}</button
-						>
-					</li>
-				{/each}
-			</ul>
+{/snippet}
+
+<main class="container mx-auto flex min-h-dvh flex-col gap-7 p-5">
+	<!-- <div class="flex items-center justify-center"></div> -->
+	{@render Navbar()}
+	{#if isReady}
+		{#if title}
+			<div>
+				<h1 class="text-center text-2xl font-bold">
+					{title ?? 'No title'}
+				</h1>
+			</div>
+		{/if}
+		<div class="mx-auto max-w-3xl flex-1 space-y-10">
+			{@render Navigation()}
+			<div bind:this={viewer} id="viewer"></div>
+			{@render Navigation()}
 		</div>
-	</div>
+	{/if}
 </main>
