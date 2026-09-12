@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { getMimeFromExtension, resolvePath } from '$lib';
 	import { unzipSync } from 'fflate';
 
 	type Manifest = Record<string, { href: string; mediaType: string }>;
@@ -10,6 +11,7 @@
 
 	let manifest: Manifest = {};
 	let spine: Spine = $state([]);
+	let basePath: string | null = null;
 
 	const domParser = new DOMParser();
 
@@ -32,7 +34,7 @@
 		const opfPath = rootFileEl.getAttribute('full-path');
 		if (!opfPath) return;
 
-		const opfBasePath = opfPath.slice(0, opfPath.lastIndexOf('/') + 1);
+		basePath = opfPath.slice(0, opfPath.lastIndexOf('/') + 1);
 		const opfXml = new TextDecoder().decode(files[opfPath]);
 		const opfDoc = domParser.parseFromString(opfXml, 'application/xml');
 
@@ -42,7 +44,7 @@
 			const id = item.getAttribute('id') ?? '';
 			const href = item.getAttribute('href');
 			const mediaType = item.getAttribute('media-type') ?? '';
-			manifest[id] = { href: href ? opfBasePath.concat(href) : '', mediaType };
+			manifest[id] = { href: href ? basePath.concat(href) : '', mediaType };
 		}
 
 		const metadataTitle = opfDoc.getElementsByTagName('dc:title')[0];
@@ -57,12 +59,28 @@
 			spine.push({ id, href });
 		}
 
-		const currentSpine = spine[2];
+		const currentSpine = spine[0];
 		const currentFile = files[currentSpine.href];
 		const raw = new TextDecoder().decode(currentFile);
 		const doc = domParser.parseFromString(raw, 'application/xhtml+xml');
-		const html = new XMLSerializer().serializeToString(doc);
 
+		const images = doc.querySelectorAll('img');
+		for (const image of images) {
+			const imageUrl = image.getAttribute('src') ?? '';
+			const targetImage = resolvePath(basePath, imageUrl);
+
+			const imageFile = files[targetImage];
+            const fileName = targetImage.split("/").pop()
+            if(!fileName) continue
+
+			const mimeType = getMimeFromExtension(fileName);
+			const blob = new Blob([imageFile], { type: mimeType });
+			const newUrl = URL.createObjectURL(blob);
+
+			image.setAttribute('src', newUrl);
+		}
+
+		const html = new XMLSerializer().serializeToString(doc);
 		viewer!.innerHTML = html;
 	};
 </script>
