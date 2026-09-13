@@ -1,174 +1,109 @@
 <script lang="ts">
-	import { getMimeFromExtension, resolvePath, type Manifest, type Spine, type NavItem } from '$lib';
-	import { unzipSync, type Unzipped } from 'fflate';
+	import { type Manifest, type Spine } from '$lib/utils';
+	import { type Unzipped } from 'fflate';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { tick } from 'svelte';
-	import SideBar from '$lib/components/sideBar.svelte';
+	import { EpubParser } from '$lib/epub';
 
-	let isReady = $state(false);
-
-	let viewer = $state<HTMLDivElement | null>(null);
+	let fileName: string | null = null;
 	let shadowRoot: ShadowRoot | null = null;
+	let basePath: string = '';
+	let files: Unzipped | null = null;
+    
+	const currentIndex = $derived(Number(page.url.searchParams.get('index') ?? 0));
 
-	let fileName = $state<string | null>(null);
+	let status = $state<'loading' | 'ready' | 'done'>('ready');
+	let viewer = $state<HTMLDivElement | null>(null);
 	let title = $state<string | null>(null);
 
-	let manifest: Manifest = {};
 	let spine: Array<Spine> = $state([]);
-	let basePath: string | null = null;
+	let manifest: Manifest = {};
+	let activeBlobUrls: string[] = [];
 
-	let currentIndex = $derived(Number(page.url.searchParams.get('index') ?? 0));
-	let list = $state<Array<NavItem>>([]);
+	const cssCache: Map<string, CSSStyleSheet> = new Map();
+	const epub = new EpubParser();
 
-	const domParser = new DOMParser();
-	let files: Unzipped | null = null;
+	function revokeBlobUrls(): void {
+		for (const url of activeBlobUrls) {
+			URL.revokeObjectURL(url);
+		}
+		activeBlobUrls = [];
+	}
 
 	const onFileChange = async (e: Event) => {
-		isReady = false;
-		const target = e.target as HTMLInputElement;
-		const file = target.files?.[0];
+		try {
+			status = 'loading';
 
-		if (!file) return;
-		fileName = file.name;
+			revokeBlobUrls();
 
-		const buffer = await file.arrayBuffer();
-		files = unzipSync(new Uint8Array(buffer));
+			const target = e.target as HTMLInputElement;
+			const file = target.files?.[0];
 
-		const cXml = new TextDecoder().decode(files['META-INF/container.xml']);
-		const cDoc = domParser.parseFromString(cXml, 'application/xml');
+			if (!file) throw new Error('File is not found');
+			fileName = file.name;
+			const buffer = await file.arrayBuffer();
 
-		const rootFileEl = cDoc.querySelector('rootfile');
-		if (!rootFileEl) return;
+			files = await epub.unzipEpub(buffer);
+			const { opfPath, opfDoc } = epub.getOpf(files);
 
-		const opfPath = rootFileEl.getAttribute('full-path');
-		if (!opfPath) return;
+			basePath = opfPath.slice(0, opfPath.lastIndexOf('/') + 1);
 
-		basePath = opfPath.slice(0, opfPath.lastIndexOf('/') + 1);
-		const opfXml = new TextDecoder().decode(files[opfPath]);
-		const opfDoc = domParser.parseFromString(opfXml, 'application/xml');
+			manifest = epub.extractManifest(opfDoc);
+			title = epub.extractTitle(opfDoc);
+			spine = epub.extractSpine(opfDoc, manifest);
 
-		manifest = getManifest(opfDoc);
-		title = getTitle(opfDoc);
-		spine = getSpine(opfDoc);
-
-		const navXml = new TextDecoder().decode(files[manifest['nav'].href]);
-		const navDoc = domParser.parseFromString(navXml, 'application/xhtml+xml');
-		list = getList(navDoc);
-
-		isReady = true;
-		tick().then(() => {
+			status = 'done';
+			await tick();
 			renderChapter();
-		});
+		} catch (e) {
+			console.log(e);
+			status = 'done';
+		} finally {
+			status = 'done';
+		}
 	};
 
-	function getList(navDoc: Document): Array<NavItem> {
-		const items = navDoc.querySelectorAll('li > a');
-		const result: Array<NavItem> = [];
-		for (const [index, item] of items.entries()) {
-			if (index === 0) {
-				result.push({ index, href: 'cover.xhtml', title: 'Cover page' });
-			}
-
-			const href = item.getAttribute('href');
-			if (!href) continue;
-
-			const title = item.textContent;
-			if (!title) continue;
-
-			result.push({ index: index + 1, href, title });
-		}
-
-		return result;
-	}
-
-	function getManifest(opfDoc: Document): Manifest {
-		if (!basePath) return {};
-
-		const manifest: Manifest = {};
-		const manifestItems = opfDoc.querySelectorAll('manifest > item');
-		for (const item of manifestItems) {
-			const id = item.getAttribute('id') ?? '';
-			const href = item.getAttribute('href');
-			const mediaType = item.getAttribute('media-type') ?? '';
-			manifest[id] = { href: href ? basePath.concat(href) : '', mediaType };
-		}
-
-		return manifest;
-	}
-
-	function getSpine(opfDoc: Document): Array<Spine> {
-		const spineItems = opfDoc.querySelectorAll('spine > itemref');
-		const spine: Array<Spine> = [];
-		for (const sItem of spineItems) {
-			const id = sItem.getAttribute('idref') ?? '';
-			const href = manifest[id].href;
-			spine.push({ id, href });
-		}
-
-		return spine;
-	}
-
-	function getTitle(opfDoc: Document): string | null {
-		const metadataTitle = opfDoc.getElementsByTagName('dc:title')[0];
-		if (!metadataTitle) return null;
-		return metadataTitle.textContent;
-	}
-
 	function renderChapter(): void {
-		if (!files) return;
+		if (!files || !viewer) return;
 		const currentSpine = spine[currentIndex];
 		const currentFile = files[currentSpine.href];
-		const raw = new TextDecoder().decode(currentFile);
-		const doc = domParser.parseFromString(raw, 'application/xhtml+xml');
 
-		if (!basePath) return;
-		const images = doc.querySelectorAll('img, image');
-		for (const image of images) {
-			const imageUrl = image.getAttribute('src') ?? '';
-			const targetImage = resolvePath(basePath, imageUrl);
+		const raw = epub.decode(currentFile);
+		const doc = epub.domParse(raw);
 
-			const imageFile = files[targetImage];
-			const fileName = targetImage.split('/').pop();
-			if (!fileName) continue;
+		const images = epub.resolveImage(doc, basePath, files);
+		const sheets = epub.resolveStyleSheet(doc, basePath, files, cssCache);
 
-			const mimeType = getMimeFromExtension(fileName);
-			const blob = new Blob([imageFile], { type: mimeType });
-			const newUrl = URL.createObjectURL(blob);
+		activeBlobUrls = activeBlobUrls.concat(images);
 
-			image.setAttribute('src', newUrl);
-		}
-
-		const html = new XMLSerializer().serializeToString(doc);
 		if (!shadowRoot) {
-			shadowRoot = viewer!.attachShadow({ mode: 'closed' });
+			shadowRoot = viewer.attachShadow({ mode: 'open' });
 		}
-		shadowRoot.innerHTML = '';
-		shadowRoot.innerHTML = html;
-		viewer!.scrollTop = 0;
+
+		shadowRoot.adoptedStyleSheets = sheets;
+		shadowRoot.innerHTML = doc.body.innerHTML ?? doc.documentElement.innerHTML;
+		viewer.scrollTop = 0;
 	}
 
 	function prevIndex() {
 		if (currentIndex < 0) return;
 		goto(`?index=${currentIndex - 1}`).then(() => renderChapter());
 	}
-
 	function nextIndex() {
 		if (currentIndex > spine.length + 1) return;
 		goto(`?index=${currentIndex + 1}`).then(() => renderChapter());
 	}
 
 	function resetIndex() {
-		currentIndex = 0;
-		goto(`?index=${currentIndex}`).then(() => renderChapter());
+		goto(`?index=0`).then(() => renderChapter());
 	}
 
-	function changeSpineIndex(index: number) {
-		if (index < 0 && index > spine.length + 1) return;
-		goto(`?index=${index}`).then(() => renderChapter());
-	}
-
-	$inspect(isReady);
+	$effect(() => {
+		if (currentIndex) {
+			revokeBlobUrls();
+		}
+	});
 </script>
 
 {#snippet Navigation()}
@@ -183,6 +118,7 @@
 	<div class="navbar gap-5 bg-base-100">
 		<div class="flex-1">
 			<input
+				disabled={status === 'done'}
 				onchange={onFileChange}
 				class="file-input file-input-sm md:file-input-md"
 				id="epub-input"
@@ -190,18 +126,12 @@
 				accept=".epub,application/epub+zip"
 			/>
 		</div>
-		<div class="flex-none">
-			{#if isReady}
-				<SideBar {changeSpineIndex} {list} />
-			{/if}
-		</div>
 	</div>
 {/snippet}
 
 <main class="container mx-auto flex min-h-dvh flex-col gap-7 p-5">
-	<!-- <div class="flex items-center justify-center"></div> -->
 	{@render Navbar()}
-	{#if isReady}
+	{#if status === 'done'}
 		{#if title}
 			<div>
 				<h1 class="text-center text-2xl font-bold">
@@ -209,10 +139,14 @@
 				</h1>
 			</div>
 		{/if}
-		<div class="mx-auto max-w-3xl flex-1 space-y-10">
+		<div class="mx-auto w-full max-w-3xl flex-1 space-y-10">
 			{@render Navigation()}
 			<div bind:this={viewer} id="viewer"></div>
 			{@render Navigation()}
+		</div>
+	{:else if status === 'loading'}
+		<div class="flex h-full w-full items-center justify-center">
+			<p>Loading...</p>
 		</div>
 	{/if}
 </main>

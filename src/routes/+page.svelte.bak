@@ -1,0 +1,300 @@
+<script lang="ts">
+	import { getMimeFromExtension, resolvePath, type Manifest, type Spine, type NavItem } from '$lib';
+	import { unzip, type Unzipped } from 'fflate';
+	import { tick } from 'svelte';
+	import DOMPurify from 'dompurify';
+	import SideBar from '$lib/components/sideBar.svelte';
+
+	let isReady = $state(false);
+	let isLoading = $state(false);
+
+	let viewer = $state<HTMLDivElement | null>(null);
+	let shadowRoot: ShadowRoot | null = null;
+
+	let fileName = $state<string | null>(null);
+	let title = $state<string | null>(null);
+
+	let manifest: Manifest = {};
+	let spine: Array<Spine> = $state([]);
+	let basePath: string = '';
+
+	let currentIndex = $state(0);
+	let list = $state<Array<NavItem>>([]);
+
+	const domParser = new DOMParser();
+	let files: Unzipped | null = null;
+	let activeBlobUrls: string[] = [];
+
+	function revokeBlobUrls(): void {
+		for (const url of activeBlobUrls) {
+			URL.revokeObjectURL(url);
+		}
+		activeBlobUrls = [];
+	}
+
+	const onFileChange = async (e: Event) => {
+		isReady = false;
+		isLoading = true;
+		const target = e.target as HTMLInputElement;
+		const file = target.files?.[0];
+
+		if (!file) {
+			isLoading = false;
+			return;
+		}
+		fileName = file.name;
+
+		const buffer = await file.arrayBuffer();
+
+		files = await new Promise<Unzipped>((resolve, reject) => {
+			unzip(new Uint8Array(buffer), (err, data) => {
+				if (err) reject(err);
+				else resolve(data);
+			});
+		});
+
+		const cXml = new TextDecoder().decode(files['META-INF/container.xml']);
+		const cDoc = domParser.parseFromString(cXml, 'application/xml');
+
+		const rootFileEl = cDoc.querySelector('rootfile');
+		if (!rootFileEl) {
+			isLoading = false;
+			return;
+		}
+
+		const opfPath = rootFileEl.getAttribute('full-path');
+		if (!opfPath) {
+			isLoading = false;
+			return;
+		}
+
+		basePath = opfPath.slice(0, opfPath.lastIndexOf('/') + 1);
+		const opfXml = new TextDecoder().decode(files[opfPath]);
+		const opfDoc = domParser.parseFromString(opfXml, 'application/xml');
+
+		manifest = getManifest(opfDoc);
+		title = getTitle(opfDoc);
+		spine = getSpine(opfDoc);
+		list = parseToc(opfDoc);
+
+		currentIndex = 0;
+		isReady = true;
+		isLoading = false;
+		await tick();
+		renderChapter();
+	};
+
+	function getManifest(opfDoc: Document): Manifest {
+		const manifest: Manifest = {};
+		const manifestItems = opfDoc.querySelectorAll('manifest > item');
+		for (const item of manifestItems) {
+			const id = item.getAttribute('id') ?? '';
+			const href = item.getAttribute('href');
+			const mediaType = item.getAttribute('media-type') ?? '';
+			manifest[id] = { href: href ? basePath.concat(href) : '', mediaType };
+		}
+
+		return manifest;
+	}
+
+	function getSpine(opfDoc: Document): Array<Spine> {
+		const spineItems = opfDoc.querySelectorAll('spine > itemref');
+		const spine: Array<Spine> = [];
+		for (const sItem of spineItems) {
+			const id = sItem.getAttribute('idref') ?? '';
+			const href = manifest[id].href;
+			spine.push({ id, href });
+		}
+
+		return spine;
+	}
+
+	function getTitle(opfDoc: Document): string | null {
+		const metadataTitle = opfDoc.getElementsByTagName('dc:title')[0];
+		if (!metadataTitle) return null;
+		return metadataTitle.textContent;
+	}
+
+	function parseToc(opfDoc: Document): Array<NavItem> {
+		if (!files) return [];
+
+		const tocId = opfDoc.querySelector('spine')?.getAttribute('toc');
+		if (tocId && manifest[tocId]) {
+			const ncxPath = manifest[tocId].href;
+			const ncxData = files[ncxPath];
+			if (ncxData) {
+				return parseNcx(ncxData);
+			}
+		}
+
+		for (const [id, entry] of Object.entries(manifest)) {
+			if (entry.mediaType === 'application/x-dtbncx+xml') {
+				const ncxData = files[entry.href];
+				if (ncxData) return parseNcx(ncxData);
+			}
+			if (entry.mediaType === 'application/xhtml+xml' && id.includes('nav')) {
+				const navData = files[entry.href];
+				if (navData) return parseNavDoc(navData);
+			}
+		}
+
+		return spine.map((s, i) => ({
+			index: i,
+			href: s.href,
+			title: `Chapter ${i + 1}`
+		}));
+	}
+
+	function parseNcx(ncxData: Uint8Array): Array<NavItem> {
+		const xml = new TextDecoder().decode(ncxData);
+		const doc = domParser.parseFromString(xml, 'application/xml');
+		const navPoints = doc.querySelectorAll('navPoint');
+		const items: Array<NavItem> = [];
+
+		for (const np of navPoints) {
+			const label = np.querySelector('navLabel > text')?.textContent?.trim() ?? '';
+			const src = np.querySelector('content')?.getAttribute('src') ?? '';
+			const href = resolvePath(basePath, src.split('#')[0]);
+			const spineIdx = spine.findIndex((s) => s.href === href);
+			if (spineIdx >= 0) {
+				items.push({ index: spineIdx, href, title: label || `Chapter ${spineIdx + 1}` });
+			}
+		}
+
+		return items;
+	}
+
+	function parseNavDoc(navData: Uint8Array): Array<NavItem> {
+		const xml = new TextDecoder().decode(navData);
+		const doc = domParser.parseFromString(xml, 'application/xhtml+xml');
+		const links = doc.querySelectorAll('nav[*|type="toc"] a, nav#toc a');
+		const items: Array<NavItem> = [];
+
+		for (const a of links) {
+			const label = a.textContent?.trim() ?? '';
+			const rawHref = a.getAttribute('href') ?? '';
+			const href = resolvePath(basePath, rawHref.split('#')[0]);
+			const spineIdx = spine.findIndex((s) => s.href === href);
+			if (spineIdx >= 0) {
+				items.push({ index: spineIdx, href, title: label || `Chapter ${spineIdx + 1}` });
+			}
+		}
+
+		return items;
+	}
+
+	function renderChapter(): void {
+		if (!files || spine.length === 0) return;
+		revokeBlobUrls();
+
+		const currentSpine = spine[currentIndex];
+		const currentFile = files[currentSpine.href];
+		if (!currentFile) return;
+
+		const raw = new TextDecoder().decode(currentFile);
+		const doc = domParser.parseFromString(raw, 'application/xhtml+xml');
+
+		const images = doc.querySelectorAll('img, image');
+		for (const image of images) {
+			const imageUrl = image.getAttribute('src') ?? '';
+			const targetImage = resolvePath(basePath, imageUrl);
+
+			const imageFile = files[targetImage];
+			if (!imageFile) continue;
+
+			const fName = targetImage.split('/').pop();
+			if (!fName) continue;
+
+			const mimeType = getMimeFromExtension(fName);
+			const blob = new Blob([imageFile], { type: mimeType });
+			const newUrl = URL.createObjectURL(blob);
+			activeBlobUrls.push(newUrl);
+			image.setAttribute('src', newUrl);
+		}
+
+		const serialized = new XMLSerializer().serializeToString(doc);
+		const sanitized = DOMPurify.sanitize(serialized, {
+			WHOLE_DOCUMENT: true,
+			ADD_TAGS: ['link'],
+			ADD_ATTR: ['xmlns', 'xmlns:epub', 'epub:type']
+		});
+
+		if (!shadowRoot) {
+			shadowRoot = viewer!.attachShadow({ mode: 'closed' });
+		}
+		shadowRoot.innerHTML = sanitized;
+		viewer!.scrollTop = 0;
+	}
+
+	function prevIndex() {
+		if (currentIndex <= 0) return;
+		currentIndex -= 1;
+		renderChapter();
+	}
+
+	function nextIndex() {
+		if (currentIndex >= spine.length - 1) return;
+		currentIndex += 1;
+		renderChapter();
+	}
+
+	function resetIndex() {
+		currentIndex = 0;
+		renderChapter();
+	}
+
+	function changeSpineIndex(index: number) {
+		if (index < 0 || index >= spine.length) return;
+		currentIndex = index;
+		renderChapter();
+	}
+</script>
+
+{#snippet Navigation()}
+	<div class="join grid grid-cols-3">
+		<button class="btn join-item btn-soft btn-primary" onclick={prevIndex}>Prev</button>
+		<button class="btn join-item btn-soft btn-secondary" onclick={resetIndex}>Reset</button>
+		<button class="btn join-item btn-soft btn-primary" onclick={nextIndex}>Next</button>
+	</div>
+{/snippet}
+
+{#snippet Navbar()}
+	<div class="navbar gap-5 bg-base-100">
+		<div class="flex-1">
+			<input
+				onchange={onFileChange}
+				class="file-input file-input-sm md:file-input-md"
+				id="epub-input"
+				type="file"
+				accept=".epub,application/epub+zip"
+			/>
+		</div>
+		<div class="flex-none">
+			{#if isReady}
+				<SideBar {changeSpineIndex} {list} />
+			{/if}
+		</div>
+	</div>
+{/snippet}
+
+<main class="container mx-auto flex min-h-dvh flex-col gap-7 p-5">
+	{@render Navbar()}
+	{#if isLoading}
+		<div class="flex flex-1 items-center justify-center">
+			<span class="loading loading-spinner loading-lg"></span>
+		</div>
+	{:else if isReady}
+		{#if title}
+			<div>
+				<h1 class="text-center text-2xl font-bold">
+					{title}
+				</h1>
+			</div>
+		{/if}
+		<div class="mx-auto max-w-3xl flex-1 space-y-10">
+			{@render Navigation()}
+			<div bind:this={viewer} id="viewer"></div>
+			{@render Navigation()}
+		</div>
+	{/if}
+</main>
